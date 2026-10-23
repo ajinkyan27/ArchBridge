@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Arcbridge Analytics contact API. HTTP API (API Gateway) -> Lambda -> Amazon SES.
+  Deploy with AWS SAM after building: npm run backend:build, then sam deploy --guided.
+  No email addresses, account IDs or regions are hard-coded; all come from parameters.
+
+Parameters:
+  ContactRecipientEmail:
+    Type: String
+    Description: Mailbox that receives enquiries (must be SES-verified while the account is in the SES sandbox).
+    AllowedPattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+  ContactFromEmail:
+    Type: String
+    Description: Sender address on an SES-verified domain or address, e.g. a no-reply address on your domain.
+    AllowedPattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Description: Exact site origins allowed to call the API (scheme + host, no trailing slash). Include http://localhost:3000 only on non-production stacks.
+  SesConfigurationSet:
+    Type: String
+    Default: ""
+    Description: Optional SES configuration set name for delivery event tracking.
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic ARN notified when the API or Lambda reports errors.
+  ThrottleBurstLimit:
+    Type: Number
+    Default: 5
+  ThrottleRateLimit:
+    Type: Number
+    Default: 1
+    Description: Steady-state requests per second across the whole API.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  HasConfigurationSet: !Not [!Equals [!Ref SesConfigurationSet, ""]]
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 10
+
+Resources:
+  ContactHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: Arcbridge contact form API
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [content-type]
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ThrottleBurstLimit
+        ThrottlingRateLimit: !Ref ThrottleRateLimit
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        # Metadata only: no request bodies or source IPs.
+        Format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","latency":"$context.responseLatency","integrationError":"$context.integrationErrorMessage"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  ContactFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Validates website enquiries and forwards them via SES
+      CodeUri: dist/
+      Handler: index.handler
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
+      Environment:
+        Variables:
+          CONTACT_RECIPIENT_EMAIL: !Ref ContactRecipientEmail
+          CONTACT_FROM_EMAIL: !Ref ContactFromEmail
+          ALLOWED_ORIGINS: !Join [",", !Ref AllowedOrigins]
+          SES_CONFIGURATION_SET: !Ref SesConfigurationSet
+          SITE_NAME: Arcbridge Analytics
+      Policies:
+        # Least privilege: send email only, only as the configured From address.
+        # identity/* covers the sender identity and (in the SES sandbox) the verified recipient.
+        - Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource:
+                - !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+                - !If
+                  - HasConfigurationSet
+                  - !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${SesConfigurationSet}
+                  - !Ref AWS::NoValue
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Ref ContactFromEmail
+      Events:
+        Enquiry:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ContactHttpApi
+            Path: /enquiries
+            Method: POST
+            PayloadFormatVersion: "2.0"
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  FunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Contact Lambda threw unhandled errors or timed out
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ContactFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Contact API returned 5xx responses (e.g. SES delivery failures, misconfiguration)
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ContactHttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+Outputs:
+  ContactApiUrl:
+    Description: Set NEXT_PUBLIC_CONTACT_API_URL to this value when building the website.
+    Value: !Sub https://${ContactHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/enquiries
+  ContactFunctionName:
+    Value: !Ref ContactFunction
